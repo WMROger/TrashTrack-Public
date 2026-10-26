@@ -1,0 +1,33 @@
+name: TrashTrack model monitoring
+
+on:
+  schedule:
+    - cron: '0 1 1 * *'
+  workflow_dispatch:
+    inputs:
+      force_retrain:
+        description: Force the five-seed retraining gate
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r ml/requirements.txt
+      - name: Monitor and conditionally retrain
+        run: python ml/monitor_and_retrain.py ${{ inputs.force_retrain == true && '--force' || '' }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trashtrack-model-monitoring
+          path: |
+            output/ml/model_monitoring_report.json
+            output/ml/model_registry.json
+            output/ml/stability_report.json
+            data/lstmForecastArtifact.json

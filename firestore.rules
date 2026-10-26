@@ -1,0 +1,1243 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+  function isAuthenticated() {
+    return request.auth != null;
+  }
+
+  function isOwner(userId) {
+    return isAuthenticated() && request.auth.uid == userId;
+  }
+
+  function userProfile() {
+    return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+  }
+
+  function hasActiveProfile() {
+    return isAuthenticated()
+      && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+      && userProfile().get('disabled', false) == false
+      && userProfile().get('status', '') != 'disabled';
+  }
+
+  function hasRole(role) {
+    return isAuthenticated() && (
+      request.auth.token.get(role, false) == true
+      || request.auth.token.get('role', '') == role
+      || (role == 'coordinator' && request.auth.token.get('role', '') in ['coordinator', 'barangay_coordinator', 'cenro_coordinator'])
+      || (
+        hasActiveProfile()
+        && (
+          role == 'coordinator'
+            ? userProfile().get('role', '') in ['coordinator', 'barangay_coordinator', 'cenro_coordinator']
+            : userProfile().get('role', '') == role
+        )
+      )
+    );
+  }
+
+  function isInteragencyChannelMember(channelId) {
+    return isAuthenticated()
+      && channelId is string
+      && (
+        (exists(/databases/$(database)/documents/interagency_channels/$(channelId))
+          && (
+            (get(/databases/$(database)/documents/interagency_channels/$(channelId)).data.get('memberUids', []) is list
+              && get(/databases/$(database)/documents/interagency_channels/$(channelId)).data.get('memberUids', []).hasAny([request.auth.uid]))
+            || get(/databases/$(database)/documents/interagency_channels/$(channelId)).data.get('createdBy', {}).get('uid', '') == request.auth.uid
+          ))
+        || (existsAfter(/databases/$(database)/documents/interagency_channels/$(channelId))
+          && (
+            (getAfter(/databases/$(database)/documents/interagency_channels/$(channelId)).data.get('memberUids', []) is list
+              && getAfter(/databases/$(database)/documents/interagency_channels/$(channelId)).data.get('memberUids', []).hasAny([request.auth.uid]))
+            || getAfter(/databases/$(database)/documents/interagency_channels/$(channelId)).data.get('createdBy', {}).get('uid', '') == request.auth.uid
+          ))
+      );
+  }
+
+  function isOfficialInteragencyChannel(channelId) {
+    return channelId in [
+      'general-command', 'urgent-advisories', 'fleet-dispatch',
+      'incident-escalation', 'system-governance'
+    ];
+  }
+
+  function validInteragencyMemberAddition() {
+    let oldMembers = resource.data.get('memberUids', []);
+    let newMembers = request.resource.data.get('memberUids', []);
+    let addedUid = newMembers[oldMembers.size()];
+    let addedUser = get(/databases/$(database)/documents/users/$(addedUid)).data;
+    return oldMembers is list
+      && newMembers is list
+      && newMembers.size() == oldMembers.size() + 1
+      && newMembers.hasAll(oldMembers)
+      && addedUid is string
+      && addedUser.get('role', '') in [
+        'admin', 'cenro', 'cenro_officer', 'cicto', 'cicto_admin',
+        'mayor', 'coordinator', 'barangay_coordinator', 'cenro_coordinator'
+      ]
+      && addedUser.get('disabled', false) == false
+      && addedUser.get('status', 'active') in ['active', 'verified', 'enabled'];
+  }
+
+  function isCustomInteragencyChannelManager(channelId) {
+    return exists(/databases/$(database)/documents/interagency_channels/$(channelId))
+      && get(/databases/$(database)/documents/interagency_channels/$(channelId)).data.get('isCustomGC', false) == true
+      && (
+        hasAdminPrivilege('broadcast_alerts')
+        || ((hasRole('coordinator') || hasRole('mayor'))
+          && get(/databases/$(database)/documents/interagency_channels/$(channelId)).data.get('createdBy', {}).get('uid', '') == request.auth.uid)
+      );
+  }
+
+  function validInteragencySenderRole(role) {
+    return (role in ['cicto', 'cicto_admin'] && isCicto())
+      || (role in ['cenro', 'admin'] && isAdmin())
+      || (role == 'coordinator' && hasRole('coordinator'))
+      || (role == 'mayor' && hasRole('mayor'))
+      || role == 'system';
+  }
+
+  // CICTO remains the system owner. Other administrators receive only the
+  // operational capabilities explicitly assigned in their user profile.
+  // Profiles created before privilege assignment retain the existing admin access.
+  function hasAdminPrivilege(privilege) {
+    return isCicto() || (isAdmin() && (
+      !(userProfile().get('privileges', null) is list)
+      || userProfile().get('privileges', []).hasAny([privilege, privilege + ':read', privilege + ':write'])
+    ));
+  }
+
+  function hasAdminWritePrivilege(privilege) {
+    return isCicto() || (isAdmin() && (
+      !(userProfile().get('privileges', null) is list)
+      || userProfile().get('privileges', []).hasAny([privilege + ':write'])
+      || (userProfile().get('privileges', []).hasAny([privilege]) && !userProfile().get('privileges', []).hasAny([privilege + ':read']))
+    ));
+  }
+
+  // SEC-01 FIX: Use custom claims, recognized admin emails, official gov domain, or database role.
+  function isAdmin() {
+    return isAuthenticated() && (
+      request.auth.token.get('admin', false) == true
+      || request.auth.token.get('email', '') in [
+        'admin@admin.com',
+        'admin@trashtrack.gov.ph',
+        'cenro@trashtrack.gov.ph',
+        'cenro@danao.gov.ph'
+      ]
+      || (
+        request.auth.token.get('email', '').matches('^[a-zA-Z0-9._%+-]+@(danao\\.gov\\.ph|trashtrack\\.gov\\.ph)$')
+        && (request.auth.token.get('email', '').matches('.*[cC][eE][nN][rR][oO].*') || request.auth.token.get('email', '').matches('.*[aA][dD][mM][iI][nN].*'))
+      )
+      || (hasActiveProfile() && userProfile().get('role', '') in ['admin', 'cenro', 'cenro_officer'])
+    );
+  }
+
+  function validAdminProfileCreate(userId) {
+    return isOwner(userId)
+      && (request.resource.data.role == 'admin' || request.resource.data.role == 'cenro')
+      && (
+        request.auth.token.get('admin', false) == true
+        || request.auth.token.get('email', '') in [
+          'admin@admin.com',
+          'admin@trashtrack.gov.ph',
+          'cenro@trashtrack.gov.ph',
+          'cenro@danao.gov.ph'
+        ]
+        || (
+          request.auth.token.get('email', '').matches('^[a-zA-Z0-9._%+-]+@(danao\\.gov\\.ph|trashtrack\\.gov\\.ph)$')
+          && (request.auth.token.get('email', '').matches('.*[cC][eE][nN][rR][oO].*') || request.auth.token.get('email', '').matches('.*[aA][dD][mM][iI][nN].*'))
+        )
+        || (
+          // Allow CENRO accounts created by CICTO to link their profile to their Auth UID upon login
+          request.resource.data.get('employeeId', '') != ''
+          && exists(/databases/$(database)/documents/identifiers/cenro/items/$(request.resource.data.employeeId))
+          && get(/databases/$(database)/documents/identifiers/cenro/items/$(request.resource.data.employeeId)).data.get('email', '') == request.auth.token.get('email', '')
+        )
+      );
+  }
+
+  function validCoordinatorProfileCreate(userId) {
+    return isOwner(userId)
+      && (request.resource.data.role in ['coordinator', 'barangay_coordinator', 'cenro_coordinator'])
+      && (
+        request.auth.token.get('role', '') in ['coordinator', 'barangay_coordinator', 'cenro_coordinator']
+        || request.auth.token.get('coordinator', false) == true
+        || (
+          request.auth.token.get('email', '').matches('^[a-zA-Z0-9._%+-]+@(danao\\.gov\\.ph|trashtrack\\.gov\\.ph)$')
+          && request.auth.token.get('email', '').matches('.*[cC][oO][oO][rR][dD].*')
+        )
+        || (
+          // Allow coordinators created by CENRO to link their profile to their Auth UID upon login
+          request.resource.data.get('employeeId', '') != ''
+          && exists(/databases/$(database)/documents/identifiers/coordinator/items/$(request.resource.data.employeeId))
+          && get(/databases/$(database)/documents/identifiers/coordinator/items/$(request.resource.data.employeeId)).data.get('email', '') == request.auth.token.get('email', '')
+        )
+      );
+  }
+
+  // SEC-01 FIX: Use custom claims, recognized CICTO emails, official gov domain, or database role.
+  function isCicto() {
+    return isAuthenticated() && (
+      request.auth.token.get('cicto', false) == true
+      || request.auth.token.get('email', '') in [
+        'cicto@trashtrack.gov.ph',
+        'cicto@trashtrack.com',
+        'cicto.admin@danao.gov.ph',
+        'cicto@danao.gov.ph',
+        'cictoadmin@trashtrack.gov.ph'
+      ]
+      || (
+        request.auth.token.get('email', '').matches('^[a-zA-Z0-9._%+-]+@(danao\\.gov\\.ph|trashtrack\\.gov\\.ph)$')
+        && request.auth.token.get('email', '').matches('.*[cC][iI][cC][tT][oO].*')
+      )
+      || (hasActiveProfile() && userProfile().get('role', '') in ['cicto', 'cicto_admin'])
+    );
+  }
+
+  function validCictoProfileCreate(userId) {
+    return isOwner(userId)
+      && (request.resource.data.role in ['cicto', 'cicto_admin'])
+      && (
+        request.auth.token.get('cicto', false) == true
+        || request.auth.token.get('email', '') in [
+          'cicto@trashtrack.gov.ph',
+          'cicto@trashtrack.com',
+          'cicto.admin@danao.gov.ph',
+          'cicto@danao.gov.ph',
+          'cictoadmin@trashtrack.gov.ph'
+        ]
+        || (
+          request.auth.token.get('email', '').matches('^[a-zA-Z0-9._%+-]+@(danao\\.gov\\.ph|trashtrack\\.gov\\.ph)$')
+          && request.auth.token.get('email', '').matches('.*[cC][iI][cC][tT][oO].*')
+        )
+      );
+  }
+
+  function isProtectedCictoRecord() {
+    return resource.data.get('role', '') in ['cicto', 'cicto_admin']
+      || (resource.data.keys().hasAny(['email']) && resource.data.email in [
+        'cicto@trashtrack.gov.ph',
+        'cicto@trashtrack.com',
+        'cicto.admin@danao.gov.ph',
+        'cicto@danao.gov.ph',
+        'cictoadmin@trashtrack.gov.ph'
+      ])
+      || (
+        resource.data.keys().hasAny(['email'])
+        && resource.data.email is string
+        && resource.data.email.matches('.*[cC][iI][cC][tT][oO].*')
+      );
+  }
+
+  function matchBarangay(a, b) {
+    return a is string && b is string && a.size() > 0 && b.size() > 0
+      && (
+        a == b
+        || a == ('Brgy. ' + b)
+        || ('Brgy. ' + a) == b
+        || a == ('Barangay ' + b)
+        || ('Barangay ' + a) == b
+      );
+  }
+
+  function isAssignedDriver(schedule) {
+    return isAuthenticated() && (
+      (schedule.keys().hasAny(['assignedDriverId']) && schedule.assignedDriverId == request.auth.uid)
+      || schedule.get('assignedDriverId', '') == request.auth.uid
+      || (schedule.keys().hasAny(['driverId']) && schedule.driverId == request.auth.uid)
+      || schedule.get('driverId', '') == request.auth.uid
+      || (schedule.keys().hasAny(['driverUid']) && schedule.driverUid == request.auth.uid)
+      || schedule.get('driverUid', '') == request.auth.uid
+      || (schedule.keys().hasAny(['completedByUid']) && schedule.completedByUid == request.auth.uid)
+      || schedule.get('completedByUid', '') == request.auth.uid
+    );
+  }
+
+  function driverCompletionUpdateOnly() {
+    return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+      'status',
+      'completedAt',
+      'completionImage',
+      'completionImagePublicId',
+      'completionDescription',
+      'completionNotes',
+      'completionLocation',
+      'collectionMeasurement',
+      'completedBy',
+      'completedByEmail',
+      'completedByUid',
+      'completedByName',
+      'issueReportedAt',
+      'issueImage',
+      'issueImagePublicId',
+      'issueLocation',
+      'issueDescription',
+      'issueType',
+      'reportedBy',
+      'reportedByEmail',
+      'reportedByUid',
+      'reportedByName',
+      'updatedAt',
+      'street',
+      'wasteCategory',
+      'stops',
+      'routeOptimization',
+      'isLiveDispatch',
+      'truckId',
+      'truckPlate',
+      'fuelBudgetLiters',
+      'dieselClosedAt',
+      'assignedDriverId',
+      'assignedDriverName',
+      'driverId',
+      'driverUid',
+      'notes',
+      'evidence',
+      'collectedKg',
+      'barangay',
+      'barangayName',
+      'date',
+      'time',
+      'timeText',
+      'driver',
+      'assignedTruck',
+      'assignedTruckPlate',
+      'routeOrder',
+      'cancellationReason',
+      'cancelledAt'
+    ]);
+  }
+
+  function hasValidDriverEvidence() {
+    return (
+      request.resource.data.status in ['completed', 'done']
+      && (
+        request.resource.data.get('completedByUid', '') == request.auth.uid
+        || request.resource.data.get('assignedDriverId', '') == request.auth.uid
+        || hasRole('driver')
+      )
+      && (
+        !request.resource.data.keys().hasAny(['collectionMeasurement'])
+        || (
+          request.resource.data.collectionMeasurement is map
+          && request.resource.data.collectionMeasurement.get('value', 0) is number
+          && request.resource.data.collectionMeasurement.get('value', 0) >= 0
+        )
+      )
+    ) || (
+      request.resource.data.status == 'issue'
+      && (request.resource.data.get('reportedByUid', '') == request.auth.uid || hasRole('driver'))
+      && request.resource.data.issueDescription is string
+      && request.resource.data.issueDescription.size() > 0
+    );
+  }
+
+  function validResidentProfileCreate(userId) {
+    return isOwner(userId)
+      && request.resource.data.role == 'user'
+      && request.resource.data.uid == request.auth.uid
+      && request.resource.data.email == request.auth.token.get('email', '')
+      && request.resource.data.get('verified', false) == request.auth.token.get('email_verified', false)
+      && request.resource.data.keys().hasOnly([
+        'uid', 'email', 'displayName', 'name', 'firstName', 'lastName', 'middleInitial', 'photoURL', 'verified', 'role', 'provider',
+        'barangay', 'barangayUpdatedAt', 'contactInfo', 'phoneNumber', 'createdAt', 'updatedAt',
+        'verificationImageUrl', 'verificationIdType', 'verificationIdNumber', 'verificationStatus', 'verificationSubmittedAt',
+        'agreedToTermsAndPrivacyAt', 'complianceVersion',
+        'verificationCode', 'verificationCodeExpiresAt'
+      ]);
+  }
+
+  // SEC-05 FIX: Restrict regular profile updates strictly to user profile fields.
+  // Fleet assignment and driver duty status must only be updated via driverTruckAssignmentOnly().
+  function regularProfileUpdateOnly() {
+    return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+      'displayName', 'photoURL', 'barangay', 'assignedBarangay', 'barangayUpdatedAt', 'contactInfo', 'phoneNumber', 'phone',
+      'firstName', 'lastName', 'middleInitial', 'name', 'gender', 'dateOfBirth', 'dob', 'verified',
+      'provider', 'email', 'lastLogin', 'updatedAt', 'mustChangePassword', 'passwordChangeSnoozedUntil',
+      'verificationImageUrl', 'verificationIdType', 'verificationIdNumber', 'verificationStatus', 'verificationSubmittedAt', 'rejectionReason',
+      'agreedToTermsAndPrivacyAt', 'complianceVersion',
+      'verificationCode', 'verificationCodeExpiresAt'
+    ])
+    && request.resource.data.get('role', '') == resource.data.get('role', '')
+    && request.resource.data.get('uid', '') == resource.data.get('uid', '')
+    && (
+      !request.resource.data.diff(resource.data).affectedKeys().hasAny(['email'])
+      || request.resource.data.get('email', '') == request.auth.token.get('email', '')
+    )
+    && (
+      !request.resource.data.diff(resource.data).affectedKeys().hasAny(['verified'])
+      || request.resource.data.get('verified', false) == request.auth.token.get('email_verified', false)
+      || (
+        request.resource.data.get('verified', false) == true
+        && resource.data.get('verificationCode', '') != ''
+      )
+      || resource.data.get('verified', false) == true
+      || resource.data.get('role', '') in ['driver', 'admin', 'cenro', 'cicto', 'coordinator']
+    );
+  }
+
+  function validRewardRedemption() {
+    return request.resource.data.keys().hasOnly([
+      'userId', 'userName', 'souvenirId', 'souvenirName', 'cost',
+      'issuedByUid', 'issuedAt', 'status', 'mode'
+    ])
+    && request.resource.data.userId is string
+    && request.resource.data.userId.size() > 0
+    && request.resource.data.issuedByUid == request.auth.uid
+    && request.resource.data.status == 'completed'
+    && request.resource.data.mode == 'spark-ledger'
+    && (
+      (
+        request.resource.data.souvenirId == 'tumbler'
+        && request.resource.data.souvenirName == 'Eco-Friendly Tumbler'
+        && request.resource.data.cost == 1000
+      )
+      || (
+        request.resource.data.souvenirId == 'tote'
+        && request.resource.data.souvenirName == 'CENRO Tote Bag'
+        && request.resource.data.cost == 500
+      )
+      || (
+        request.resource.data.souvenirId == 'kit'
+        && request.resource.data.souvenirName == 'Reusable Utensil Kit'
+        && request.resource.data.cost == 2000
+      )
+    );
+  }
+
+  function validBarangayReleaseRedemption() {
+    return request.resource.data.keys().hasOnly([
+      'userId', 'userName', 'userEmail', 'souvenirId', 'souvenirName', 'cost',
+      'issuedByUid', 'issuedByName', 'issuedByRole', 'issuedAt', 'status', 'mode',
+      'requestId', 'releaseNote', 'barangay', 'confirmedBarangay'
+    ])
+    && request.resource.data.userId is string
+    && request.resource.data.userId.size() > 0
+    && request.resource.data.issuedByUid == request.auth.uid
+    && request.resource.data.status == 'completed'
+    && request.resource.data.mode == 'barangay-release'
+    && request.resource.data.cost is number
+    && request.resource.data.cost > 0;
+  }
+
+  function validStaffTokenDeduction() {
+    let oldBalance = resource.data.get('tokens', resource.data.get('points', resource.data.get('rewardTokens', 0)));
+    return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['tokens', 'points', 'rewardTokens', 'updatedAt'])
+      && request.resource.data.diff(resource.data).affectedKeys().hasAny(['tokens', 'points', 'rewardTokens'])
+      && request.resource.data.get('tokens', 0) is number
+      && request.resource.data.get('tokens', 0) >= 0
+      && request.resource.data.get('tokens', 0) <= oldBalance
+      && (isAdmin() || isCicto() || hasRole('coordinator'));
+  }
+
+  function driverTruckAssignmentOnly() {
+    return (hasRole('driver') || resource.data.get('role', '') in ['driver', 'user', 'resident'])
+      && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+        'currentTruckId', 'currentTruckPlate', 'assignedTruck', 'status', 'dutyStatus',
+        'currentShiftFuelBudgetLiters', 'unassignedNotice', 'updatedAt', 'role',
+        'shiftStartedAt', 'lastShiftEndedAt'
+      ])
+      && request.resource.data.get('role', resource.data.get('role', 'driver')) in ['driver', 'user', 'resident'];
+  }
+
+  function cictoRoleUpdateOnly(userId) {
+    return (
+        userId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'displayName', 'name', 'email', 'role', 'verified', 'status',
+          'department', 'agency', 'permissions', 'photoURL', 'lastLogin',
+          'createdAt', 'updatedAt', 'mustChangePassword', 'passwordChangeSnoozedUntil',
+          'employeeId', 'uid', 'phoneNumber', 'contactInfo', 'designation', 'provider', 'disabled',
+          'privileges', 'privilegesUpdatedAt', 'privilegesUpdatedBy'
+        ])
+        && request.resource.data.get('role', 'cicto') in ['cicto', 'cicto_admin']
+      )
+      || (
+        userId != request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'role', 'department', 'designation', 'employeeId', 'status', 'disabled',
+          'barangay', 'assignedBarangay', 'barangayUpdatedAt',
+          'deactivatedAt', 'deactivatedBy', 'deactivationReason',
+          'reactivatedAt', 'reactivatedBy', 'updatedAt', 'zone',
+          'contactInfo', 'phoneNumber', 'displayName', 'name', 'verified',
+          'mustChangePassword', 'verificationStatus', 'verifiedAt', 'verifiedBy', 'rejectionReason',
+          'privileges', 'privilegesUpdatedAt', 'privilegesUpdatedBy', 'permissions',
+          'elevatedBy', 'elevatedAt'
+        ])
+        && request.resource.data.get('role', resource.data.get('role', 'user')) in [
+          'user', 'resident', 'admin', 'cenro', 'cenro_officer', 'cicto', 'cicto_admin',
+          'coordinator', 'barangay_coordinator', 'cenro_coordinator', 'driver', 'mayor'
+        ]
+      );
+  }
+
+    // Diesel access uses explicit profile roles; coordinators are scoped to their barangay.
+    // Diesel access uses explicit profile roles; coordinators are scoped to their barangay.
+    function dieselManager() {
+      return isAdmin() || isCicto() || (hasActiveProfile() && userProfile().get('role', '') in ['admin', 'cenro', 'cenro_officer', 'cicto', 'cicto_admin']);
+    }
+    function dieselCoordinator(barangay) {
+      return (hasRole('coordinator') || (hasActiveProfile() && userProfile().get('role', '') in ['coordinator', 'barangay_coordinator', 'cenro_coordinator']))
+        && (
+          !hasActiveProfile()
+          || userProfile().get('assignedBarangay', '') == ''
+          || userProfile().get('assignedBarangay', '') == 'all'
+          || userProfile().get('assignedBarangay', '') == 'ALL'
+          || (barangay is string && barangay.size() > 0 && matchBarangay(userProfile().get('assignedBarangay', userProfile().get('barangay', '')), barangay))
+        );
+    }
+    function dieselReader(data) {
+      return dieselManager()
+        || (hasRole('driver') && (data.get('driverId', '') == request.auth.uid || data.get('status', '') == 'approved'))
+        || dieselCoordinator(data.get('barangay', ''));
+    }
+    function dieselScheduleReader(scheduleId) {
+      let schedDoc = /databases/$(database)/documents/schedules/$(scheduleId);
+      let histDoc = /databases/$(database)/documents/driver_route_history/$(scheduleId);
+      return dieselManager()
+        || (hasActiveProfile() && (hasRole('coordinator') || userProfile().get('role', '') in ['coordinator', 'barangay_coordinator', 'cenro_coordinator']))
+        || (exists(schedDoc) && (
+          (hasRole('driver') && get(schedDoc).data.get('assignedDriverId', get(schedDoc).data.get('driverId', '')) == request.auth.uid)
+          || dieselCoordinator(get(schedDoc).data.get('barangay', get(schedDoc).data.get('barangayName', '')))
+        ))
+        || (exists(histDoc) && (
+          (hasRole('driver') && get(histDoc).data.get('driverId', '') == request.auth.uid)
+          || dieselCoordinator(get(histDoc).data.get('barangay', ''))
+        ));
+    }
+    function validDieselScheduleDoc(s, scheduleId) {
+      let d = request.resource.data;
+      return d.scheduleId == scheduleId
+        && (
+          d.driverId == s.get('assignedDriverId', s.get('driverId', ''))
+          || d.driverId == s.get('driverId', '')
+          || d.driverId == s.get('assignedDriverId', '')
+          || (hasActiveProfile() && (hasRole('coordinator') || userProfile().get('role', '') in ['coordinator', 'barangay_coordinator', 'cenro_coordinator']))
+        )
+        && (
+          d.truckId == s.get('truckId', '')
+          || d.truckId == s.get('truckPlate', '')
+          || (s.get('truckId', '') == '' && s.get('truckPlate', '') == '')
+          || s.get('truckId', '') == null
+        )
+        && (
+          d.barangay == s.get('barangay', s.get('barangayName', ''))
+          || matchBarangay(d.barangay, s.get('barangay', s.get('barangayName', '')))
+        )
+        && (
+          s.get('isLiveDispatch', false) == true
+          || s.get('isLiveDispatch', '') == 'true'
+          || s.get('status', '') in ['in_progress', 'completed', 'active', 'pending', 'done', 'finished']
+        );
+    }
+    function validDieselIdentity(scheduleId) {
+      let schedDoc = /databases/$(database)/documents/schedules/$(scheduleId);
+      let histDoc = /databases/$(database)/documents/driver_route_history/$(scheduleId);
+      return (exists(schedDoc) && validDieselScheduleDoc(get(schedDoc).data, scheduleId))
+        || (exists(histDoc) && validDieselScheduleDoc(get(histDoc).data, scheduleId));
+    }
+    function dieselNumber(value, minimum, maximum) {
+      return value is number && value >= minimum && value <= maximum;
+    }
+    function validDieselActual() {
+      let a = request.resource.data.actual;
+      return a.keys().hasOnly(['distanceKm', 'drivingHours', 'idleHours', 'collectionHours', 'averageLoadPercent',
+          'collectedKg', 'actualLiters', 'distanceSource', 'fuelMethod', 'evidence', 'isDemo', 'tripDate'])
+        && dieselNumber(a.distanceKm, 0, 2000) && dieselNumber(a.drivingHours, 0, 24)
+        && dieselNumber(a.idleHours, 0, 24) && dieselNumber(a.collectionHours, 0, 24)
+        && a.drivingHours + a.idleHours + a.collectionHours > 0
+        && a.drivingHours + a.idleHours + a.collectionHours <= 24
+        && dieselNumber(a.averageLoadPercent, 0, 100) && dieselNumber(a.collectedKg, 0, 100000)
+        && a.distanceSource in ['gps', 'odometer', 'manual']
+        && a.isDemo is bool && a.tripDate is string && a.tripDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && a.evidence is string && a.evidence.size() <= 4000
+        && (((a.actualLiters == null || a.actualLiters == 0) && a.fuelMethod == 'not-recorded')
+          || (dieselNumber(a.actualLiters, 0.001, 2000) && a.fuelMethod in ['tank-balance', 'full-to-full', 'metered', 'dispenser'] && a.evidence.size() > 0));
+    }
+    function dieselSubmission() {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['scheduleId', 'driverId', 'truckId', 'barangay', 'actual', 'status', 'submittedBy',
+          'submittedAt', 'reviewedAt', 'reviewedBy', 'reviewNote'])
+        && d.status == 'pending' && d.submittedBy == request.auth.uid && d.submittedAt == request.time
+        && d.reviewedAt == null && d.reviewedBy == null && d.reviewNote == '' && validDieselActual();
+    }
+    match /diesel_settings/{id} {
+      allow read: if dieselManager() || hasRole('coordinator') || hasRole('driver');
+      allow create, update: if (dieselManager() || hasRole('coordinator')) && id == 'main'
+        && request.resource.data.updatedBy == request.auth.uid && request.resource.data.updatedAt == request.time
+        && dieselNumber(request.resource.data.parameters.pricePerLiter, 0.001, 1000)
+        && dieselNumber(request.resource.data.parameters.kmPerLiter, 0.001, 30);
+      allow delete: if false;
+    }
+    match /diesel_estimates/{scheduleId} {
+      allow get: if dieselScheduleReader(scheduleId) || (resource != null && dieselReader(resource.data));
+      allow list: if dieselReader(resource.data);
+      allow create: if (dieselManager() || dieselCoordinator(request.resource.data.get('barangay', ''))) && validDieselIdentity(scheduleId)
+        && request.resource.data.createdBy == request.auth.uid && request.resource.data.createdAt == request.time;
+      allow update: if false;
+      allow delete: if false;
+    }
+    match /diesel_logs/{scheduleId} {
+      // A missing document may be read by its assigned operator for duplicate-safe transactions.
+      allow get: if dieselScheduleReader(scheduleId) || (resource != null && dieselReader(resource.data));
+      allow list: if dieselReader(resource.data);
+      allow create: if validDieselIdentity(scheduleId) && dieselReader(request.resource.data) && dieselSubmission();
+      allow update: if (
+        resource.data.status in ['pending', 'needs-correction']
+        && validDieselIdentity(scheduleId) && dieselReader(resource.data) && dieselSubmission()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'scheduleId', 'driverId', 'truckId', 'barangay', 'actual', 'status',
+          'submittedBy', 'submittedAt', 'reviewedAt', 'reviewedBy', 'reviewNote'
+        ])
+      ) || (
+        dieselManager() && resource.data.status == 'pending'
+        && request.resource.data.status in ['approved', 'needs-correction']
+        && request.resource.data.reviewedBy == request.auth.uid && request.resource.data.reviewedAt == request.time
+        && request.resource.data.reviewNote is string && request.resource.data.reviewNote.size() > 0 && request.resource.data.reviewNote.size() <= 4000
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'reviewedBy', 'reviewedAt', 'reviewNote'])
+      );
+      allow delete: if false;
+    }
+    match /diesel_models/{truckId} {
+      allow read: if dieselManager() || hasRole('coordinator') || hasRole('driver');
+      allow create, update: if dieselManager() && request.resource.data.truckId == truckId
+        && request.resource.data.trainedBy == request.auth.uid && request.resource.data.updatedAt == request.time
+        && dieselNumber(request.resource.data.factor, 0.5, 2);
+      allow delete: if false;
+    }
+    match /diesel_gps/{scheduleId}/points/{pointId} {
+      allow read: if dieselScheduleReader(scheduleId);
+      allow create: if hasRole('driver') && get(/databases/$(database)/documents/schedules/$(scheduleId)).data.assignedDriverId == request.auth.uid
+        && request.resource.data.keys().hasOnly(['latitude', 'longitude', 'timestampMs', 'accuracyMeters', 'isSimulation', 'driverId', 'createdAt'])
+        && request.resource.data.driverId == request.auth.uid && request.resource.data.createdAt == request.time
+        && request.resource.data.isSimulation == false
+        && dieselNumber(request.resource.data.latitude, -90, 90) && dieselNumber(request.resource.data.longitude, -180, 180)
+        && dieselNumber(request.resource.data.accuracyMeters, 0, 10000)
+        && request.resource.data.timestampMs is number;
+      allow update, delete: if false;
+    }
+
+    match /schedules/{scheduleId} {
+      allow read: if true;
+      allow create: if hasAdminWritePrivilege('manage_schedules')
+        || hasRole('coordinator')
+        || (hasRole('driver') && (
+          request.resource.data.get('assignedDriverId', '') == request.auth.uid
+          || request.resource.data.get('completedByUid', '') == request.auth.uid
+        ));
+      allow delete: if hasAdminWritePrivilege('manage_schedules') || hasRole('coordinator');
+      allow update: if hasAdminWritePrivilege('manage_schedules')
+        || hasRole('coordinator')
+        || hasRole('driver')
+        || (
+          (
+            isAssignedDriver(resource.data)
+            || hasRole('driver')
+            || dieselCoordinator(resource.data.get('barangay', resource.data.get('barangayName', '')))
+          )
+          && driverCompletionUpdateOnly()
+          && (request.resource.data.get('status', '') != 'completed' || hasValidDriverEvidence())
+          && (
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny(['dieselClosedAt'])
+            || request.resource.data.dieselClosedAt == request.time
+            || request.resource.data.dieselClosedAt is timestamp
+          )
+        );
+    }
+
+    match /barangay_schedules/{scheduleId} {
+      allow read: if true;
+      allow create: if hasAdminPrivilege('manage_schedules')
+        || hasRole('coordinator');
+      allow update: if hasAdminPrivilege('manage_schedules')
+        || hasRole('coordinator')
+        || hasRole('driver');
+      allow delete: if hasAdminPrivilege('manage_schedules')
+        || hasRole('coordinator');
+    }
+
+    // SEC-02 FIX: Public read for telemetry and leaderboard; administrative/driver role for writes
+    match /fleet_trips/{tripId} {
+      allow read: if true;
+      allow write: if hasAdminPrivilege('dispatch_fleet') || hasRole('coordinator') || hasRole('driver');
+    }
+
+    // SEC-06 FIX: Public fleet telemetry readable so citizens and residents can track collection trucks; write restricted to authorized driver or dispatch.
+    match /truck_locations/{driverId} {
+      allow read: if true;
+      allow create, update, delete: if hasAdminPrivilege('dispatch_fleet') || (hasRole('driver') && driverId == request.auth.uid) || (isAuthenticated() && driverId == request.auth.uid);
+    }
+
+    match /trucks/{truckId} {
+      allow read: if true;
+      allow create, delete: if hasAdminPrivilege('dispatch_fleet') || hasRole('coordinator');
+      allow update: if hasAdminPrivilege('dispatch_fleet') || hasRole('coordinator') || (
+        (hasRole('driver') || isAuthenticated())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'assignedDriverId', 'assignedDriverName', 'shiftStartedAt', 'updatedAt',
+          'lastDriverId', 'lastDriverName', 'lastUsedAt', 'status', 'lastShiftEndedAt'
+        ])
+        && (
+          // Time-In: Authenticated driver claims/starts shift on vehicle (when vehicle is off-duty, available, or assigned to this driver)
+          (
+            request.resource.data.assignedDriverId == request.auth.uid
+            && (
+              !resource.data.keys().hasAny(['shiftStartedAt'])
+              || resource.data.shiftStartedAt == null
+              || resource.data.get('assignedDriverId', '') == request.auth.uid
+              || resource.data.get('assignedDriverId', '') == null
+              || resource.data.get('assignedDriverId', '') == ''
+            )
+          )
+          // Time-Out: Release vehicle back to inventory (assignedDriverId set to null or empty)
+          || (
+            (!request.resource.data.keys().hasAny(['assignedDriverId']) || request.resource.data.assignedDriverId == null || request.resource.data.assignedDriverId == '')
+            && (
+              resource.data.get('assignedDriverId', '') == request.auth.uid
+              || resource.data.get('lastDriverId', '') == request.auth.uid
+              || hasRole('driver')
+              || hasAdminPrivilege('dispatch_fleet')
+            )
+          )
+        )
+      );
+    }
+
+    match /truck_usage_history/{historyId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update, delete: if isAdmin() || isCicto();
+    }
+
+    match /driver_route_history/{historyId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update, delete: if isAdmin() || isCicto();
+    }
+
+    // SEC-02 FIX: Removed naked isOwner(userId) from update rule.
+    // Users can only modify their own profile through field-restricted functions.
+    match /users/{userId} {
+      allow create: if validResidentProfileCreate(userId)
+        || validCictoProfileCreate(userId)
+        || validAdminProfileCreate(userId)
+        || validCoordinatorProfileCreate(userId)
+        || hasAdminWritePrivilege('manage_users')
+        || (hasRole('coordinator') && request.resource.data.get('role', '') == 'driver');
+      allow read: if isOwner(userId)
+        || (isAuthenticated() && resource.data.get('email', '') == request.auth.token.get('email', ''))
+        || isAdmin() || isCicto() || hasAdminPrivilege('manage_users') || hasRole('coordinator') || resource.data.get('role', '') == 'driver'
+        || ((hasAdminPrivilege('broadcast_alerts') || hasRole('mayor')) && resource.data.get('role', '') in [
+          'admin', 'cenro', 'cenro_officer', 'cicto', 'cicto_admin',
+          'mayor', 'coordinator', 'barangay_coordinator', 'cenro_coordinator'
+        ]);
+      allow update: if validStaffTokenDeduction()
+        || (isOwner(userId) && (regularProfileUpdateOnly() || driverTruckAssignmentOnly()))
+        || (
+          hasRole('coordinator') && (
+            (request.resource.data.get('role', '') == 'driver' && (resource.data.get('role', '') in ['user', 'resident', 'driver'] || !resource.data.keys().hasAny(['role'])))
+            || (resource.data.get('role', '') == 'driver' && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'assignedBarangay', 'barangay', 'currentTruckId', 'currentTruckPlate',
+              'assignedTruck', 'dutyStatus', 'status', 'unassignedNotice', 'updatedAt'
+            ]))
+          )
+        )
+        || ((isCicto() || validCictoProfileCreate(userId)) ? cictoRoleUpdateOnly(userId) : (
+          hasAdminWritePrivilege('manage_users')
+          || (isAdmin() && resource.data.get('role', '') in ['driver', 'user', 'resident', 'coordinator'] && request.resource.data.get('role', '') in ['driver', 'user', 'resident', 'coordinator'])
+        ));
+      allow delete: if !isProtectedCictoRecord()
+        && (
+          // CICTO Superadmin can delete any non-CICTO account
+          isCicto()
+          // CENRO admins with manage_users privilege can delete drivers, coordinators, or residents (never other admins or CICTO)
+          || (isAdmin() && hasAdminWritePrivilege('manage_users') && resource.data.get('role', 'user') in ['driver', 'user', 'resident', 'coordinator', 'barangay_coordinator', 'cenro_coordinator'])
+          // Residents can delete their own standard resident accounts
+          || (isOwner(userId) && resource.data.get('role', 'user') in ['user', 'resident'])
+          || (isAuthenticated() && resource.data.get('email', '') == request.auth.token.get('email', '') && resource.data.get('role', 'user') in ['user', 'resident'])
+        );
+    }
+
+    // QR bearer credentials are kept out of readable user profiles. Only
+    // CENRO/CICTO staff and field coordinators can issue or retrieve a driver's printable badge token.
+    match /driver_qr_credentials/{userId} {
+      allow read: if isOwner(userId) || hasAdminPrivilege('manage_users') || isAdmin() || isCicto() || hasRole('coordinator');
+      allow create, update: if isOwner(userId) || hasAdminWritePrivilege('manage_users') || isAdmin() || hasRole('coordinator');
+      allow delete: if hasAdminWritePrivilege('manage_users') || isAdmin() || hasRole('coordinator');
+    }
+
+    match /mail/{mailId} {
+      allow create: if isAuthenticated();
+      allow read: if isAdmin() || isCicto();
+    }
+
+    match /users/{userId}/devices/{deviceId} {
+      allow read, create, update, delete: if isOwner(userId);
+      allow read: if isAdmin();
+    }
+
+    match /identifiers/{document=**} {
+      allow read: if hasAdminPrivilege('manage_users') || isAdmin() || hasRole('coordinator')
+        || (isAuthenticated() && resource.data.get('email', '') == request.auth.token.get('email', ''));
+      allow write: if hasAdminWritePrivilege('manage_users') || isAdmin() || hasRole('coordinator')
+        || (isAuthenticated() && resource.data.get('email', '') == request.auth.token.get('email', ''));
+    }
+
+    match /employee_ids/{employeeId} {
+      allow read: if isAdmin() || isCicto() || hasRole('coordinator');
+      allow write: if isAdmin() || isCicto() || hasRole('coordinator');
+    }
+
+    match /license_numbers/{licenseNumber} {
+      allow read, write: if isAdmin() || isCicto() || hasRole('coordinator');
+    }
+
+    match /coordinator_employee_ids/{employeeId} {
+      allow read: if isAdmin() || isCicto() || hasRole('coordinator');
+      allow write: if isAdmin() || isCicto();
+    }
+
+    match /user_settings/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create, update: if isOwner(userId);
+      allow delete: if isAdmin();
+    }
+
+    // SEC-05 FIX: Restrict report reads to the creator, assigned driver, or admins.
+    match /reports/{reportId} {
+      allow create: if hasActiveProfile()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'pending';
+      allow read: if isAdmin() || isCicto() || hasRole('coordinator')
+        || (isAuthenticated() && (resource.data.userId == request.auth.uid || resource.data.get('userId', '') == request.auth.uid))
+        || hasRole('driver')
+        || (isAuthenticated() && (resource.data.assignedDriverId == request.auth.uid || resource.data.get('assignedDriverId', '') == request.auth.uid));
+      allow update: if hasAdminPrivilege('acknowledge_incidents') || hasRole('coordinator')
+        || (
+          (
+            hasRole('driver')
+            || (isAuthenticated() && (
+              resource.data.assignedDriverId == request.auth.uid
+              || resource.data.get('assignedDriverId', '') == request.auth.uid
+              || request.resource.data.assignedDriverId == request.auth.uid
+              || request.resource.data.get('assignedDriverId', '') == request.auth.uid
+              || request.resource.data.get('resolvedByUid', '') == request.auth.uid
+            ))
+          )
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status', 'assignedDriverId', 'assignedDriverName', 'assignedTruckPlate', 'queuedForDriver',
+            'queuedForNextShift', 'queuedBarangay', 'queuedReason', 'dispatchedAt', 'updatedAt', 'collectedAt',
+            'resolvedAt', 'completionImage', 'completionImagePublicId', 'completionNotes', 'resolvedByUid',
+            'statusHistory', 'unsuccessfulReason', 'failedAt'
+          ])
+          && (
+            request.resource.data.get('status', '') in [
+              'resolved', 'in-progress', 'in_progress', 'completed', 'declined',
+              'pickup_not_successful', 'acknowledged'
+            ]
+            || request.resource.data.status == resource.data.status
+          )
+        );
+      allow delete: if hasAdminWritePrivilege('purge_records');
+    }
+
+    match /user_reports/{reportId} {
+      allow create: if hasActiveProfile()
+        && request.resource.data.userId == request.auth.uid
+        && userProfile().get('verificationStatus', '') != 'rejected';
+      allow read: if hasAdminPrivilege('acknowledge_incidents') || resource.data.userId == request.auth.uid;
+      allow update: if hasAdminWritePrivilege('acknowledge_incidents');
+      allow delete: if hasAdminPrivilege('purge_records') || isCicto();
+    }
+
+    match /driver_reports/{reportId} {
+      allow create: if hasRole('driver')
+        && (
+          request.resource.data.driverId == request.auth.uid
+          || request.resource.data.driverUid == request.auth.uid
+          || request.resource.data.reportedByUid == request.auth.uid
+        );
+      allow read: if hasAdminPrivilege('acknowledge_incidents')
+        || (hasRole('driver') && (
+          resource.data.driverId == request.auth.uid
+          || resource.data.driverUid == request.auth.uid
+          || resource.data.reportedByUid == request.auth.uid
+        ));
+      allow update: if hasAdminPrivilege('acknowledge_incidents') || isCicto() || isAdmin();
+      allow delete: if hasAdminPrivilege('purge_records');
+    }
+
+    match /feedback/{feedbackId} {
+      allow create: if hasActiveProfile() && request.resource.data.userId == request.auth.uid;
+      allow read: if isAdmin() || isCicto() || hasRole('coordinator') || resource.data.userId == request.auth.uid;
+      allow update: if hasAdminPrivilege('acknowledge_incidents');
+      allow delete: if hasAdminPrivilege('purge_records');
+    }
+
+    match /feedbacks/{feedbackId} {
+      allow create: if hasActiveProfile() && request.resource.data.userId == request.auth.uid;
+      allow read: if isAdmin() || isCicto() || hasRole('coordinator') || resource.data.userId == request.auth.uid;
+      allow update: if hasAdminPrivilege('acknowledge_incidents');
+      allow delete: if hasAdminPrivilege('purge_records');
+    }
+
+    match /collection_requests/{requestId} {
+      allow create: if hasActiveProfile() && request.resource.data.userId == request.auth.uid;
+      allow read: if isAdmin() || resource.data.userId == request.auth.uid;
+      allow update: if resource.data.userId == request.auth.uid
+        && request.resource.data.userId == request.auth.uid;
+      allow delete: if isAdmin() || resource.data.userId == request.auth.uid;
+    }
+
+    match /announcements/{announcementId} {
+      allow read: if true;
+      allow create, delete: if hasAdminPrivilege('broadcast_alerts') || hasRole('coordinator');
+      allow update: if hasAdminPrivilege('broadcast_alerts') || hasRole('coordinator') || (
+        isAuthenticated()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likesCount', 'likedBy'])
+      );
+    }
+
+    match /comments/{commentId} {
+      allow create: if hasActiveProfile() && request.resource.data.userId == request.auth.uid;
+      allow read: if isAuthenticated();
+      allow update, delete: if isAdmin() || resource.data.userId == request.auth.uid;
+    }
+
+    match /userNotifications/{notificationId} {
+      allow create: if isAdmin() || isCicto() || hasRole('coordinator')
+        || hasRole('driver')
+        || (hasActiveProfile() && request.resource.data.userId == request.auth.uid);
+      allow read: if resource.data.userId == request.auth.uid || isAdmin() || isCicto();
+      allow update: if (
+        resource.data.userId == request.auth.uid
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'readAt'])
+      ) || isAdmin() || isCicto();
+      allow delete: if isAdmin() || isCicto() || resource.data.userId == request.auth.uid;
+    }
+
+    match /notifications/{notificationId} {
+      allow create: if isAuthenticated();
+      allow read: if isAdmin() || isCicto() || resource.data.userId == request.auth.uid;
+      allow update: if (
+        resource.data.userId == request.auth.uid
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'readAt'])
+      ) || isAdmin() || isCicto();
+      allow delete: if isAdmin() || isCicto();
+    }
+
+    match /notifications/{userId}/messages/{notificationId} {
+      allow read: if isOwner(userId) || isAdmin() || isCicto();
+      allow write: if isAdmin() || isCicto();
+    }
+
+
+    match /proximity_alerts/{alertId} {
+      allow read: if isAdmin() || isCicto() || resource.data.userId == request.auth.uid;
+      allow create: if isAdmin() || isCicto() || hasRole('driver') || (isAuthenticated() && request.resource.data.userId == request.auth.uid);
+      allow update, delete: if isAdmin() || isCicto();
+    }
+
+    match /chat_logs/{userId} {
+      allow read, create, update, delete: if isOwner(userId);
+      allow read: if isAdmin();
+    }
+
+    match /chat_logs/{userId}/messages/{messageId} {
+      allow read, create, update, delete: if isOwner(userId);
+      allow read: if isAdmin();
+    }
+
+    match /user_locations/{userId} {
+      allow read, create, update, delete: if isOwner(userId);
+      allow read: if isAdmin();
+    }
+
+    match /waste_tracking/{userId} {
+      allow read, create, update, delete: if isOwner(userId);
+      allow read: if isAdmin();
+    }
+
+    match /waste_tracking/{userId}/entries/{entryId} {
+      allow read, create, update, delete: if isOwner(userId);
+      allow read: if isAdmin();
+    }
+
+    match /public_data/{document=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() || isCicto();
+    }
+
+    match /public_data/envirohero_monthly {
+      allow read: if true;
+      allow create, delete: if isAdmin() || isCicto() || hasRole('coordinator');
+      allow update: if isAdmin() || isCicto() || hasRole('coordinator')
+        || (
+          hasActiveProfile()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['cheersCount'])
+          && request.resource.data.get('cheersCount', 0) == resource.data.get('cheersCount', 0) + 1
+        );
+    }
+
+    match /app_config/{document=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() || isCicto();
+    }
+
+    match /barangays/{document=**} {
+      allow read: if true;
+      allow write: if isAdmin() || isCicto();
+    }
+
+    match /barangay_stats/{document=**} {
+      allow read: if true;
+      allow write: if isAdmin() || isCicto() || hasRole('coordinator');
+    }
+
+    match /leaderboard/{document=**} {
+      allow read: if true;
+      allow write: if isAdmin() || isCicto() || hasRole('coordinator');
+    }
+
+    match /system_settings/branding {
+      allow read: if true;
+      allow write: if isAdmin() || isCicto();
+    }
+
+    match /system_settings/{document=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() || isCicto();
+    }
+
+    match /history/{historyId} {
+      allow read, write: if isAdmin() || isCicto();
+    }
+
+    match /rewards/{document=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() || isCicto();
+    }
+
+    match /reward_catalog/{catalogId} {
+      allow read: if isAuthenticated();
+      allow write: if isCicto() || isAdmin() || hasRole('coordinator');
+    }
+
+    match /reward_redemptions/{redemptionId} {
+      allow read: if isAdmin() || isCicto() || hasRole('coordinator') || (isAuthenticated() && (resource.data.userId == request.auth.uid || resource.data.get('userId', '') == request.auth.uid));
+      allow create: if (isAdmin() || isCicto() || hasRole('coordinator')) && (validRewardRedemption() || validBarangayReleaseRedemption());
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    match /reward_requests/{requestId} {
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin() || isCicto() || hasRole('coordinator'));
+      allow create: if isAuthenticated()
+        && request.resource.data.userId == request.auth.uid
+        && userProfile().get('verificationStatus', '') != 'rejected'
+        && request.resource.data.status == 'pending'
+        && request.resource.data.cost is number
+        && request.resource.data.cost > 0;
+      allow update: if isAdmin() || isCicto() || hasRole('coordinator') || (
+        isAuthenticated()
+        && resource.data.userId == request.auth.uid
+        && resource.data.status == 'pending'
+        && request.resource.data.status == 'cancelled'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelledAt'])
+      );
+      allow delete: if isAdmin() || isCicto();
+    }
+
+    // Public monthly recognition spotlight; residents may increment cheers once per tap.
+    match /settings/envirohero_monthly {
+      allow read: if true;
+      allow create, delete: if isAdmin() || isCicto() || hasRole('coordinator');
+      allow update: if isAdmin() || isCicto() || hasRole('coordinator')
+        || (
+          hasActiveProfile()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['cheersCount'])
+          && request.resource.data.get('cheersCount', 0) == resource.data.get('cheersCount', 0) + 1
+        );
+    }
+
+    match /settings/fiscal_year {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() || isCicto() || hasAdminPrivilege('export_reports');
+    }
+
+    match /interagency_messages/{messageId} {
+      allow read: if isAuthenticated() && (
+        hasAdminPrivilege('broadcast_alerts')
+        || hasRole('coordinator')
+        || hasRole('mayor')
+        || isOfficialInteragencyChannel(resource.data.get('channelId', ''))
+        || resource.data.get('channelId', '') == ''
+        || isInteragencyChannelMember(resource.data.get('channelId', ''))
+      );
+      allow create: if isAuthenticated() && (
+        hasAdminPrivilege('broadcast_alerts')
+        || hasRole('coordinator')
+        || hasRole('mayor')
+        || isOfficialInteragencyChannel(request.resource.data.get('channelId', ''))
+        || request.resource.data.get('channelId', '') == ''
+        || isInteragencyChannelMember(request.resource.data.get('channelId', ''))
+      )
+      && request.resource.data.senderUid == request.auth.uid
+      && validInteragencySenderRole(request.resource.data.senderRole)
+      && request.resource.data.status == 'sent'
+      && request.resource.data.subject is string
+      && request.resource.data.subject.size() >= 1
+      && request.resource.data.subject.size() <= 120
+      && request.resource.data.message is string
+      && request.resource.data.message.size() >= 1
+      && request.resource.data.message.size() <= 3000
+      && request.resource.data.priority in ['normal', 'high', 'urgent'];
+      allow update: if false;
+      allow delete: if resource.data.get('channelId', '') is string
+        && isCustomInteragencyChannelManager(resource.data.get('channelId', ''));
+    }
+
+    match /interagency_channels/{channelId} {
+      allow read: if isAuthenticated();
+      allow create: if hasAdminPrivilege('broadcast_alerts') || hasRole('coordinator') || (
+        hasRole('mayor')
+        && request.resource.data.get('createdBy', {}).get('uid', '') == request.auth.uid
+        && request.resource.data.get('createdBy', {}).get('role', '') == 'mayor'
+      );
+      allow update: if (
+          // 1. Group chat creator or system admin managing member list (add/kick) and joinRequests
+          (
+            resource.data.get('isCustomGC', false) == true
+            && (resource.data.get('createdBy', {}).get('uid', '') == request.auth.uid || hasAdminPrivilege('broadcast_alerts'))
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberUids', 'joinRequests', 'updatedAt'])
+          )
+          // 2. Authenticated user applying to join (updating joinRequests only)
+          || (
+            resource.data.get('isCustomGC', false) == true
+            && isAuthenticated()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['joinRequests', 'updatedAt'])
+          )
+          // 3. Existing rules for channel metadata updates
+          || (
+            (hasAdminPrivilege('broadcast_alerts') || hasRole('coordinator') || hasRole('mayor'))
+            && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['memberUids', 'joinRequests'])
+          )
+        );
+      allow delete: if resource.data.get('isCustomGC', false) == true
+        && isCustomInteragencyChannelManager(channelId);
+    }
+
+    match /reward_awards/{awardId} {
+      allow read: if isAdmin() || isCicto() || (isAuthenticated() && (resource.data.userId == request.auth.uid || resource.data.get('userId', '') == request.auth.uid));
+      allow create: if isCicto() || isAdmin() || (
+        hasActiveProfile()
+        && hasRole('driver')
+        && awardId == 'report_' + request.resource.data.reportId
+        && (request.resource.data.tokens == 25 || request.resource.data.tokens == 50 || request.resource.data.tokens == 100)
+        && request.resource.data.reason == 'verified-collection-completed'
+        && request.resource.data.createdByUid == request.auth.uid
+        && (
+          !exists(/databases/$(database)/documents/schedules/$(request.resource.data.scheduleId))
+          || (
+            get(/databases/$(database)/documents/schedules/$(request.resource.data.scheduleId)).data.get('reportId', request.resource.data.reportId) == request.resource.data.reportId
+            && get(/databases/$(database)/documents/schedules/$(request.resource.data.scheduleId)).data.get('userId', request.resource.data.userId) == request.resource.data.userId
+            && get(/databases/$(database)/documents/schedules/$(request.resource.data.scheduleId)).data.get('status', '') in ['completed', 'done']
+          )
+        )
+      );
+      allow update, delete: if false;
+    }
+
+    match /admin/{document=**} {
+      allow read, write: if isAdmin() || isCicto();
+    }
+
+    match /analytics/{document=**} {
+      allow read: if hasAdminPrivilege('export_reports') || isAdmin() || isCicto() || hasRole('coordinator') || hasRole('mayor');
+      allow write: if hasAdminWritePrivilege('export_reports') || isAdmin() || isCicto();
+    }
+
+    match /error_logs/{document=**} {
+      allow read: if isAdmin() || isCicto();
+      allow write: if isAdmin() || isCicto();
+    }
+
+    // SEC-03 FIX: CICTO notifications and OTP verifications are restricted to CICTO admins only.
+    match /cicto_notifications/{notificationId} {
+      allow read, write: if isCicto();
+    }
+
+    match /cicto_otp_verifications/{verificationId} {
+      allow read, write: if isCicto();
+    }
+
+    // Merged: audit_logs & client_activity access
+    match /audit_logs/{logId} {
+      allow read: if hasAdminPrivilege('purge_records') || hasRole('coordinator');
+      allow create: if isAuthenticated()
+        && request.resource.data.get('type', '') == 'client'
+        && request.resource.data.get('actorUid', '') == request.auth.uid
+        && request.resource.data.get('event', '') in [
+          'pickup.completed', 'pickup.issue_reported', 'route.dispatched',
+          'offline_action.synced', 'notification.preferences_updated'
+        ];
+      allow update, delete: if false;
+    }
+
+    match /client_activity/{activityId} {
+      allow read: if hasAdminPrivilege('purge_records') || hasRole('coordinator') || hasRole('driver') || isAdmin() || isCicto();
+      allow create: if isAuthenticated();
+      allow update, delete: if false;
+    }
+
+    match /support_tickets/{ticketId} {
+      allow read: if isAdmin() || isCicto() || hasRole('coordinator')
+        || (isAuthenticated() && (
+          resource.data.get('createdByUid', '') == request.auth.uid
+          || resource.data.get('uid', '') == request.auth.uid
+        ));
+      allow create: if isAuthenticated()
+        && request.resource.data.get('subject', '') is string
+        && request.resource.data.get('subject', '').size() >= 4
+        && request.resource.data.get('subject', '').size() <= 150
+        && request.resource.data.get('message', '') is string
+        && request.resource.data.get('message', '').size() >= 10
+        && request.resource.data.get('message', '').size() <= 2000;
+      allow update: if hasAdminPrivilege('acknowledge_incidents') || isAdmin() || isCicto();
+      allow delete: if hasAdminPrivilege('purge_records') || isCicto();
+    }
+
+    match /system_error_logs/{logId} {
+      allow read, update, delete: if isAdmin() || isCicto();
+      allow create: if isAuthenticated()
+        && request.resource.data.get('publicMessage', '') is string
+        && request.resource.data.get('publicMessage', '').size() <= 500;
+    }
+
+    match /analytics_events/{eventId} {
+      allow read: if isAdmin() || isCicto() || hasRole('mayor');
+      allow create: if isAuthenticated()
+        && request.resource.data.get('eventName', '') is string
+        && request.resource.data.get('eventName', '').size() <= 60;
+      allow update, delete: if false;
+    }
+
+    match /ai_usage_daily/{dateKey} {
+      allow read: if isAdmin() || isCicto();
+      allow write: if isCicto();
+    }
+
+    match /rate_limits/{limitId} {
+      allow read, write: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

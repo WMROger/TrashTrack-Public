@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#064E3B"/>
+      <stop offset="55%" stop-color="#022C22"/>
+      <stop offset="100%" stop-color="#0B1914"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#10B981"/>
+      <stop offset="100%" stop-color="#34D399"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <circle cx="1050" cy="120" r="260" fill="#10B981" opacity="0.12"/>
+  <circle cx="150" cy="540" r="220" fill="#059669" opacity="0.15"/>
+  <rect x="80" y="80" width="1040" height="470" rx="32" fill="#065F46" fill-opacity="0.35" stroke="#34D399" stroke-opacity="0.35" stroke-width="2"/>
+  <rect x="130" y="135" width="460" height="44" rx="22" fill="#ECFDF5"/>
+  <text x="155" y="163" font-family="Plus Jakarta Sans, Inter, Arial, sans-serif" font-size="16" font-weight="800" fill="#065F46" letter-spacing="1.5">REPUBLIC OF THE PHILIPPINES • DANAO CITY</text>
+  <text x="130" y="265" font-family="Plus Jakarta Sans, Inter, Arial, sans-serif" font-size="68" font-weight="800" fill="#FFFFFF">TrashTrack Danao City</text>
+  <text x="130" y="335" font-family="Plus Jakarta Sans, Inter, Arial, sans-serif" font-size="30" font-weight="600" fill="#A7F3D0">Smart Municipal Solid Waste &amp; Fleet Operations</text>
+  <text x="130" y="405" font-family="Plus Jakarta Sans, Inter, Arial, sans-serif" font-size="22" font-weight="400" fill="#D1FAE5">Real-Time GPS Truck Tracking • AI Waste Segregation • Citizen Eco-Rewards</text>
+  <rect x="130" y="455" width="340" height="46" rx="12" fill="url(#accent)"/>
+  <text x="158" y="485" font-family="Plus Jakarta Sans, Inter, Arial, sans-serif" font-size="18" font-weight="800" fill="#022C22">CENRO &amp; CICTO OFFICIAL PORTAL</text>
+</svg>
+
